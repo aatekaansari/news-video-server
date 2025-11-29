@@ -13,7 +13,7 @@ BASE_DIR = '/tmp'
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 OUTPUT_FOLDER = os.path.join(BASE_DIR, 'outputs')
 
-# Folders Reset
+# Reset folders
 if os.path.exists(UPLOAD_FOLDER): shutil.rmtree(UPLOAD_FOLDER)
 if os.path.exists(OUTPUT_FOLDER): shutil.rmtree(OUTPUT_FOLDER)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -45,103 +45,97 @@ def save_base64_file(data, prefix):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "News Server Live (Final v4)"
+    return "News Server Live (V6 Audio Fix)"
 
 @app.route('/render', methods=['POST'])
 def render_video():
     try:
-        # Clear old files to prevent overflow
+        # Cleanup
         for f in os.listdir(UPLOAD_FOLDER): os.remove(os.path.join(UPLOAD_FOLDER, f))
         for f in os.listdir(OUTPUT_FOLDER): os.remove(os.path.join(OUTPUT_FOLDER, f))
 
         data = request.json
-        print("Starting Render...")
+        print("Processing...")
 
-        # 1. Save Files
         main_audio = save_base64_file(data.get('audioData'), "audio")
         bg_music = save_base64_file(data.get('bgmData'), "bgm")
         logo = save_base64_file(data.get('logoData'), "logo")
-        
         clips = data.get('clips', [])
-        if not main_audio or not clips:
-            return jsonify({"error": "No Audio or Images found"}), 400
 
-        # 2. Build FFmpeg Command
+        if not main_audio or not clips:
+            return jsonify({"error": "Audio/Images missing"}), 400
+
         inputs = []
         filter_complex = []
         
-        # Input 0: Main Audio
+        # Audio Input [0]
         inputs.extend(['-i', main_audio])
         input_count = 1
         
+        # --- VIDEO PROCESSING ---
         visual_streams = []
-        
         for i, clip in enumerate(clips):
             path = save_base64_file(clip.get('imageData'), f"img_{i}")
             dur = str(clip.get('duration', 5))
             
-            # Input image looped
             inputs.extend(['-loop', '1', '-t', dur, '-i', path])
             
-            # --- MAGIC FIX IS HERE ---
-            # scale=...: fit image in 1280x720
-            # pad=1280:720:-1:-1 : The -1:-1 tells FFmpeg to AUTO CENTER (No maths error)
-            # format=yuv420p : Ensures correct color format
+            # Crop to fill 1280x720 (Safe Mode)
             filter_complex.append(
-                f"[{input_count}:v]scale=1280:720:force_original_aspect_ratio=decrease,"
-                f"pad=1280:720:-1:-1:color=black,setsar=1,format=yuv420p[v{i}];"
+                f"[{input_count}:v]scale=1280:720:force_original_aspect_ratio=increase,"
+                f"crop=1280:720,setsar=1,format=yuv420p[v{i}];"
             )
             visual_streams.append(f"[v{i}]")
             input_count += 1
             
-        # Concat All Clips
+        # Concat Video
         concat_str = "".join(visual_streams)
         filter_complex.append(f"{concat_str}concat=n={len(visual_streams)}:v=1:a=0[base];")
         last_vid = "[base]"
 
-        # Add Logo (if exists)
+        # Add Logo
         if logo:
             inputs.extend(['-i', logo])
-            # Resize logo to 150px width
-            filter_complex.append(f"[{input_count}:v]scale=150:-1[logo_s];")
-            # Overlay at top-left
+            filter_complex.append(f"[{input_count}:v]scale=120:-1[logo_s];")
             filter_complex.append(f"{last_vid}[logo_s]overlay=20:20[vid_logo];")
             last_vid = "[vid_logo]"
             input_count += 1
 
-        # Mix Audio (if bgm exists)
-        last_aud = "[0:a]"
+        # --- AUDIO PROCESSING (THE FIX) ---
         if bg_music:
+            # If BGM exists, we mix it using a filter
             inputs.extend(['-i', bg_music])
-            # Voice=1.0 volume, BGM=0.1 volume
             filter_complex.append(f"[{input_count}:a]volume=0.1[bgm];[0:a][bgm]amix=inputs=2:duration=first[aud_mix];")
-            last_aud = "[aud_mix]"
+            last_aud = "[aud_mix]" # Label needs brackets
+        else:
+            # If NO BGM, we use the direct input stream
+            last_aud = "0:a" # ERROR WAS HERE: Removed brackets []
 
-        output_file = os.path.join(OUTPUT_FOLDER, "final_hd.mp4")
+        output_file = os.path.join(OUTPUT_FOLDER, "final.mp4")
         
         cmd = [
             'ffmpeg', '-y',
             *inputs,
             '-filter_complex', "".join(filter_complex),
             '-map', last_vid,
-            '-map', last_aud,
+            '-map', last_aud, # Now this is correct ("0:a" or "[aud_mix]")
             '-c:v', 'libx264',
             '-pix_fmt', 'yuv420p',
+            '-preset', 'ultrafast', 
             '-shortest',
             output_file
         ]
 
-        # Execute
-        subprocess.run(cmd, check=True)
-        print("Render Success!")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print("FFmpeg Failed:", result.stderr)
+            return jsonify({"error": "Render Failed (See logs)"}), 500
 
-        return send_file(output_file, as_attachment=True, download_name="news_video.mp4")
+        return send_file(output_file, as_attachment=True, download_name="video.mp4")
 
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg Error: {e}")
-        return jsonify({"error": "Video Rendering Failed on Server"}), 500
     except Exception as e:
-        print(f"General Error: {str(e)}")
+        print(f"Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
