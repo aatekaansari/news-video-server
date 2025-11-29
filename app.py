@@ -2,14 +2,20 @@ import os
 import base64
 import subprocess
 import uuid
+import shutil
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from your website
+CORS(app)
 
-UPLOAD_FOLDER = '/tmp/uploads'
-OUTPUT_FOLDER = '/tmp/outputs'
+BASE_DIR = '/tmp'
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+OUTPUT_FOLDER = os.path.join(BASE_DIR, 'outputs')
+
+# Clean start
+if os.path.exists(UPLOAD_FOLDER): shutil.rmtree(UPLOAD_FOLDER)
+if os.path.exists(OUTPUT_FOLDER): shutil.rmtree(OUTPUT_FOLDER)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -21,111 +27,115 @@ def save_base64_file(data, prefix):
         else:
             encoded = data
             
-        ext = "jpg" # default
-        if "audio" in header if "," in data else "": ext = "mp3"
-        if "video" in header if "," in data else "": ext = "mp4"
+        ext = "bin"
+        if "image" in str(data)[:30]: ext = "jpg"
+        elif "audio" in str(data)[:30]: ext = "mp3"
+        elif "video" in str(data)[:30]: ext = "mp4"
         
         file_data = base64.b64decode(encoded)
-        filename = f"{prefix}_{uuid.uuid4().hex}.{ext}"
+        filename = f"{prefix}_{uuid.uuid4().hex[:8]}.{ext}"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
+        
         with open(filepath, "wb") as f:
             f.write(file_data)
         return filepath
     except Exception as e:
-        print(f"File Save Error: {e}")
+        print(f"File Save Error: {str(e)}")
         return None
 
 @app.route('/', methods=['GET'])
 def home():
-    return "News Video Server is Running! Use /render endpoint."
+    return "News Video Server is Running!"
 
 @app.route('/render', methods=['POST'])
 def render_video():
     try:
-        data = request.json
-        print("Starting Render Job...")
+        # Cleanup old files
+        for f in os.listdir(UPLOAD_FOLDER): os.remove(os.path.join(UPLOAD_FOLDER, f))
+        for f in os.listdir(OUTPUT_FOLDER): os.remove(os.path.join(OUTPUT_FOLDER, f))
 
-        # 1. Save Files
-        audio_path = save_base64_file(data.get('audioData'), "audio")
-        logo_path = save_base64_file(data.get('logoData'), "logo")
-        bgm_path = save_base64_file(data.get('bgmData'), "bgm")
-        ticker_text = data.get('tickerText', '')
+        data = request.json
+        print("Processing Request...")
+
+        # 1. Save Assets
+        main_audio = save_base64_file(data.get('audioData'), "audio")
+        bg_music = save_base64_file(data.get('bgmData'), "bgm")
+        logo = save_base64_file(data.get('logoData'), "logo")
         
         clips = data.get('clips', [])
-        if not audio_path or not clips:
+        if not main_audio or not clips:
             return jsonify({"error": "Audio and Images required"}), 400
 
-        # 2. Build FFmpeg Input
+        # 2. Build Command
         inputs = []
         filter_complex = []
         
-        # Input 0: Audio
-        inputs.extend(['-i', audio_path])
+        # Audio Input [0]
+        inputs.extend(['-i', main_audio])
+        input_count = 1
         
-        # Inputs 1 to N: Images
-        clip_streams = []
-        current_idx = 1
+        visual_streams = []
         
         for i, clip in enumerate(clips):
-            img_path = save_base64_file(clip.get('imageData'), f"img_{i}")
-            duration = clip.get('duration', 5)
+            path = save_base64_file(clip.get('imageData'), f"img_{i}")
+            dur = str(clip.get('duration', 5))
             
-            inputs.extend(['-loop', '1', '-t', str(duration), '-i', img_path])
+            # Loop image for duration
+            inputs.extend(['-loop', '1', '-t', dur, '-i', path])
             
-            # Scale to HD (1280x720)
-            filter_complex.append(f"[{current_idx}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}];")
-            clip_streams.append(f"[v{i}]")
-            current_idx += 1
+            # CRITICAL FIX: format=yuv420p added to ensure compatibility
+            filter_complex.append(
+                f"[{input_count}:v]scale=1280:720:force_original_aspect_ratio=decrease,"
+                f"pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v{i}];"
+            )
+            visual_streams.append(f"[v{i}]")
+            input_count += 1
             
-        # Concat Images
-        concat_str = "".join(clip_streams)
-        filter_complex.append(f"{concat_str}concat=n={len(clip_streams)}:v=1:a=0[base];")
-        last_stream = "[base]"
+        # Concat
+        concat_str = "".join(visual_streams)
+        filter_complex.append(f"{concat_str}concat=n={len(visual_streams)}:v=1:a=0[base];")
+        last_vid = "[base]"
 
-        # Add Logo
-        if logo_path:
-            inputs.extend(['-i', logo_path])
-            filter_complex.append(f"[{current_idx}:v]scale=150:-1[logo];")
-            filter_complex.append(f"{last_stream}[logo]overlay=20:20[vid_logo];")
-            last_stream = "[vid_logo]"
-            current_idx += 1
+        # Logo
+        if logo:
+            inputs.extend(['-i', logo])
+            filter_complex.append(f"[{input_count}:v]scale=120:-1[logo_s];")
+            filter_complex.append(f"{last_vid}[logo_s]overlay=20:20[vid_logo];")
+            last_vid = "[vid_logo]"
+            input_count += 1
 
-        # Add Ticker (Simplified)
-        if ticker_text:
-            # Note: Requires font, using default might fail on minimal docker without font packages
-            # We will try basic drawtext, if it fails, try without
-            pass 
+        # Audio Mix
+        last_aud = "[0:a]"
+        if bg_music:
+            inputs.extend(['-i', bg_music])
+            filter_complex.append(f"[{input_count}:a]volume=0.1[bgm];[0:a][bgm]amix=inputs=2:duration=first[aud_mix];")
+            last_aud = "[aud_mix]"
 
-        # Add BGM
-        audio_map = "[0:a]"
-        if bgm_path:
-            inputs.extend(['-i', bgm_path])
-            filter_complex.append(f"[{current_idx}:a]volume=0.1[bgm];[0:a][bgm]amix=inputs=2:duration=first[a_out];")
-            audio_map = "[a_out]"
-            current_idx += 1
-
-        # Output File
-        output_filename = f"video_{uuid.uuid4().hex}.mp4"
-        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
-
+        output_file = os.path.join(OUTPUT_FOLDER, "final.mp4")
+        
         cmd = [
             'ffmpeg', '-y',
             *inputs,
             '-filter_complex', "".join(filter_complex),
-            '-map', last_stream,
-            '-map', audio_map,
-            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+            '-map', last_vid,
+            '-map', last_aud,
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
             '-shortest',
-            output_path
+            output_file
         ]
-        
-        print("Running FFmpeg...")
-        subprocess.run(cmd, check=True)
 
-        return send_file(output_path, as_attachment=True, download_name="news_video.mp4")
+        # Run command and CAPTURE ERROR if fails
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print("FFmpeg Error:", result.stderr)
+            return jsonify({"error": f"FFmpeg Failed: {result.stderr[-200:]}"}), 500
+
+        return send_file(output_file, as_attachment=True, download_name="video.mp4")
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Server Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
