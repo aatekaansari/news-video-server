@@ -45,12 +45,12 @@ def save_base64_file(data, prefix):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "News Video Server is Running!"
+    return "News Video Server is Running! (v3 Fixed)"
 
 @app.route('/render', methods=['POST'])
 def render_video():
     try:
-        # Cleanup old files
+        # Cleanup
         for f in os.listdir(UPLOAD_FOLDER): os.remove(os.path.join(UPLOAD_FOLDER, f))
         for f in os.listdir(OUTPUT_FOLDER): os.remove(os.path.join(OUTPUT_FOLDER, f))
 
@@ -80,13 +80,14 @@ def render_video():
             path = save_base64_file(clip.get('imageData'), f"img_{i}")
             dur = str(clip.get('duration', 5))
             
-            # Loop image for duration
+            # Loop image
             inputs.extend(['-loop', '1', '-t', dur, '-i', path])
             
-            # CRITICAL FIX: format=yuv420p added to ensure compatibility
+            # FIX: Simplified Scale & Pad Logic (No calculation needed)
+            # scale=-2:720 means height 720, width auto (even number)
+            # pad=1280:720:-1:-1 means center it on 1280x720 canvas
             filter_complex.append(
-                f"[{input_count}:v]scale=1280:720:force_original_aspect_ratio=decrease,"
-                f"pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v{i}];"
+                f"[{input_count}:v]scale=-2:720,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[v{i}];"
             )
             visual_streams.append(f"[v{i}]")
             input_count += 1
@@ -121,16 +122,17 @@ def render_video():
             '-map', last_aud,
             '-c:v', 'libx264',
             '-pix_fmt', 'yuv420p',
+            '-preset', 'ultrafast',  # Faster rendering for free tier
             '-shortest',
             output_file
         ]
 
-        # Run command and CAPTURE ERROR if fails
+        # Run command
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
-            print("FFmpeg Error:", result.stderr)
-            return jsonify({"error": f"FFmpeg Failed: {result.stderr[-200:]}"}), 500
+            print("FFmpeg Error Logs:", result.stderr)
+            return jsonify({"error": "Processing Failed. Check logs."}), 500
 
         return send_file(output_file, as_attachment=True, download_name="video.mp4")
 
