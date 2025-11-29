@@ -13,29 +13,37 @@ BASE_DIR = '/tmp'
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 OUTPUT_FOLDER = os.path.join(BASE_DIR, 'outputs')
 
-# Reset folders
-if os.path.exists(UPLOAD_FOLDER): shutil.rmtree(UPLOAD_FOLDER)
-if os.path.exists(OUTPUT_FOLDER): shutil.rmtree(OUTPUT_FOLDER)
+# Reset folders on every request (Render free tier के लिए जरूरी)
+if os.path.exists(UPLOAD_FOLDER):
+    shutil.rmtree(UPLOAD_FOLDER)
+if os.path.exists(OUTPUT_FOLDER):
+    shutil.rmtree(OUTPUT_FOLDER)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+
 def save_base64_file(data, prefix):
-    if not data: return None
+    if not data:
+        return None
     try:
         if "," in data:
             header, encoded = data.split(",", 1)
         else:
             encoded = data
-            
-        ext = "bin"
-        if "image" in str(data)[:30]: ext = "jpg"
-        elif "audio" in str(data)[:30]: ext = "mp3"
-        elif "video" in str(data)[:30]: ext = "mp4"
-        
+
+        # Extension detect
+        ext = "jpg"
+        if data.startswith("data:audio"):
+            ext = "mp3"
+        elif data.startswith("data:video"):
+            ext = "mp4")
+
         file_data = base64.b64decode(encoded)
-        filename = f"{prefix}_{uuid.uuid4().hex[:8]}.{ext}"
+        if len(file_data) == 0:
+            return None
+
+        filename = f"{prefix}_{uuid.uuid4().hex[:10]}.{ext}"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
-        
         with open(filepath, "wb") as f:
             f.write(file_data)
         return filepath
@@ -43,19 +51,22 @@ def save_base64_file(data, prefix):
         print(f"File Save Error: {str(e)}")
         return None
 
+
 @app.route('/', methods=['GET'])
 def home():
-    return "News Server Live (V6 Audio Fix)"
+    return "News Server Live (V7 – Fully Fixed Audio + Image)"
+
 
 @app.route('/render', methods=['POST'])
 def render_video():
     try:
-        # Cleanup
-        for f in os.listdir(UPLOAD_FOLDER): os.remove(os.path.join(UPLOAD_FOLDER, f))
-        for f in os.listdir(OUTPUT_FOLDER): os.remove(os.path.join(OUTPUT_FOLDER, f))
+        # Cleanup old files
+        for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
+            if os.path.exists(folder):
+                shutil.rmtree(folder)
+            os.makedirs(folder, exist_ok=True)
 
         data = request.json
-        print("Processing...")
 
         main_audio = save_base64_file(data.get('audioData'), "audio")
         bg_music = save_base64_file(data.get('bgmData'), "bgm")
@@ -63,80 +74,94 @@ def render_video():
         clips = data.get('clips', [])
 
         if not main_audio or not clips:
-            return jsonify({"error": "Audio/Images missing"}), 400
+            return jsonify({"error": "Audio ya images missing hain"}), 400
 
+        # FFmpeg command parts
         inputs = []
         filter_complex = []
-        
-        # Audio Input [0]
-        inputs.extend(['-i', main_audio])
-        input_count = 1
-        
-        # --- VIDEO PROCESSING ---
-        visual_streams = []
+        input_index = 0
+
+        # 0: Main Audio
+        inputs += ['-i', main_audio]
+        input_index += 1
+
+        # Images (loop + duration)
+        video_filters = []
         for i, clip in enumerate(clips):
-            path = save_base64_file(clip.get('imageData'), f"img_{i}")
+            img_path = save_base64_file(clip.get('imageData'), f"img_{i}")
+            if not img_path:
+                continue
             dur = str(clip.get('duration', 5))
-            
-            inputs.extend(['-loop', '1', '-t', dur, '-i', path])
-            
-            # Crop to fill 1280x720 (Safe Mode)
-            filter_complex.append(
-                f"[{input_count}:v]scale=1280:720:force_original_aspect_ratio=increase,"
-                f"crop=1280:720,setsar=1,format=yuv420p[v{i}];"
+
+            inputs += ['-loop', '1', '-t', dur, '-i', img_path]
+            v_idx = input_index
+            input_index += 1
+
+            video_filters.append(
+                f"[{v_idx}:v]scale=1280:720:force_original_aspect_ratio=increase,"
+                f"crop=1280:720,format=yuv420p[v{i}];"
             )
-            visual_streams.append(f"[v{i}]")
-            input_count += 1
-            
-        # Concat Video
-        concat_str = "".join(visual_streams)
-        filter_complex.append(f"{concat_str}concat=n={len(visual_streams)}:v=1:a=0[base];")
-        last_vid = "[base]"
 
-        # Add Logo
+        # Concat all images
+        concat_parts = "".join(f"[v{i}]" for i in range(len(video_filters)))
+        video_filters.append(f"{concat_parts}concat=n={len(video_filters)}:v=1:a=0[vidbase];")
+        last_video = "[vidbase]"
+
+        # Logo overlay
         if logo:
-            inputs.extend(['-i', logo])
-            filter_complex.append(f"[{input_count}:v]scale=120:-1[logo_s];")
-            filter_complex.append(f"{last_vid}[logo_s]overlay=20:20[vid_logo];")
-            last_vid = "[vid_logo]"
-            input_count += 1
+            inputs += ['-i', logo]
+            filter_complex.append(f"[{input_index}:v]scale=150:-1[logo];")
+            filter_complex.append(f"{last_video}[logo]overlay=20:20[vidout];")
+            last_video = "[vidout]"
+            input_index += 1
 
-        # --- AUDIO PROCESSING (THE FIX) ---
-        if bg_music:
-            # If BGM exists, we mix it using a filter
-            inputs.extend(['-i', bg_music])
-            filter_complex.append(f"[{input_count}:a]volume=0.1[bgm];[0:a][bgm]amix=inputs=2:duration=first[aud_mix];")
-            last_aud = "[aud_mix]" # Label needs brackets
         else:
-            # If NO BGM, we use the direct input stream
-            last_aud = "0:a" # ERROR WAS HERE: Removed brackets []
+            filter_complex.append(f"{last_video}[vidout];")
+            last_video = "[vidout]"
 
-        output_file = os.path.join(OUTPUT_FOLDER, "final.mp4")
-        
+        # Audio mixing
+        if bg_music:
+            inputs += ['-i', bg_music]
+            filter_complex.append(f"[{input_index}:a]volume=0.15[bgm];")
+            filter_complex.append(f"[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=0[audout];")
+            final_audio_map = "[audout]"
+        else:
+            final_audio_map = "[0:a]"
+
+        # Full filter
+        filter_complex.extend(video_filters)
+        filter_complex_str = "".join(filter_complex)
+
+        output_path = os.path.join(OUTPUT_FOLDER, "final_hd.mp4")
+
         cmd = [
             'ffmpeg', '-y',
             *inputs,
-            '-filter_complex', "".join(filter_complex),
-            '-map', last_vid,
-            '-map', last_aud, # Now this is correct ("0:a" or "[aud_mix]")
+            '-filter_complex', filter_complex_str,
+            '-map', last_video,
+            '-map', final_audio_map,
             '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '18',
             '-pix_fmt', 'yuv420p',
-            '-preset', 'ultrafast', 
+            '-movflags', '+faststart',
             '-shortest',
-            output_file
+            output_path
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print("FFmpeg Failed:", result.stderr)
-            return jsonify({"error": "Render Failed (See logs)"}), 500
+        print("Running FFmpeg:", " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
-        return send_file(output_file, as_attachment=True, download_name="video.mp4")
+        if result.returncode != 0:
+            print("FFmpeg Error:", result.stderr)
+            return jsonify({"error": "FFmpeg failed", "details": result.stderr}), 500
+
+        return send_file(output_path, as_attachment=True, download_name="News_Video_HD.mp4")
 
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print("Server Error:", str(e))
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
