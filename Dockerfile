@@ -12,5 +12,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Gunicorn को सिर्फ 1 worker दो (फ्री प्लान में जरूरी)
-CMD ["gunicorn --workers 1 --threads 2 --bind 0.0.0.0:10000 app:app --timeout 180
+# Gunicorn को सिर्फ 1 worker (फ्री प्लान के लिए) और पोर्ट 10000
+CMD ["gunicorn", "--workers", "1", "--threads", "2", "--bind", "0.0.0.0:10000", "app:app", "--timeout", "180"]
